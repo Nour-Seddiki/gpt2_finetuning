@@ -23,34 +23,27 @@ Every model is the same 124M trunk with **4-bit NF4 frozen weights + LoRA** (r=8
 projections of all 12 blocks + LayerNorms: 1,218,048 trainable params, 0.97%). QLoRA isn't a memory
 necessity at 124M — full fine-tuning fits anywhere — it's here to demonstrate the technique end to end.
 
-## Model files
+## Trained weights
 
-The trained weights are in [`models/`](models/):
-
-| File | What it is | Size |
-|---|---|---|
-| `ppo_merged_bf16.pt` | **The final model.** The PPO policy at iteration 250 (the best checkpoint in the [results](#results)) with its LoRA merged into the full-precision base, stored in bf16. Runs standalone, no base checkpoint needed. Stored with Git LFS. | 238 MB |
-| `ppo_adapter_iter250.pt` | The same PPO policy as a LoRA adapter | 4.7 MB |
-| `sft_adapter.pt` | SFT adapter (Alpaca val loss 2.0769) | 4.7 MB |
-| `reward_adapter.pt` | Reward model: LoRA + scalar head (val accuracy 0.580) | 4.7 MB |
-
-The merged model is a Git LFS file: run `git lfs install` before cloning, or `git lfs pull` after.
-It loads like a pretrained checkpoint, so it needs no adapter:
+The trained weights aren't included in this repo. Training writes the LoRA adapters to
+`checkpoints/` (`sft_adapter.pt`, `reward_adapter.pt`, `ppo_adapter.pt`, ~5 MB each), and they run
+on top of the pretrained base `../mini_gpt/model_19072.pt`:
 
 ```bash
-python generate.py --base_checkpoint models/ppo_merged_bf16.pt --adapter_checkpoint none \
-    --instruction "What is the capital of France?"
+python generate.py --adapter_checkpoint checkpoints/ppo_adapter.pt --instruction "What is the capital of France?"
 ```
 
-The adapters run on top of the pretrained base `../mini_gpt/model_19072.pt`, which isn't included
-in either repo:
+For a standalone model that needs no adapter, merge one into the full-precision base and load the
+result as the base checkpoint:
 
 ```bash
-python generate.py --adapter_checkpoint models/ppo_adapter_iter250.pt --instruction "What is the capital of France?"
+python generate.py --adapter_checkpoint checkpoints/ppo_adapter.pt --merge --save_merged merged.pt --instruction "Hi"
+python generate.py --base_checkpoint merged.pt --adapter_checkpoint none --instruction "What is the capital of France?"
 ```
 
-Merging costs a little accuracy. The adapter was trained against the 4-bit base, so on the
-full-precision base, rounded to bf16, its Alpaca val loss is 2.1111 instead of 2.1037.
+Merging costs a little accuracy, because the adapter was trained against the 4-bit base. For the
+best PPO checkpoint (iteration 250), merged and stored in bf16, the Alpaca val loss went from 2.1037
+to 2.1111.
 
 ## Quickstart
 
