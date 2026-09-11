@@ -27,6 +27,12 @@ OUT_DIR=/tmp/ft MAX_TRAIN_EXAMPLES=1000 VAL_SIZE=200 BATCH_SIZE=8 EVAL_EVERY=25 
 OUT_DIR=/tmp/ft TOTAL_EPISODES=192 ROLLOUT_BATCH=16 MINI_BATCH=8 EVAL_PROMPTS=32 EVAL_EVERY=4 MAX_NEW_TOKENS=64 python train_ppo.py
 
 # full pipeline (A100): python train.py && python train_reward.py && python train_ppo.py
+# full pipeline on the local 8 GB Windows laptop - runtime.py knobs, see Gotchas
+export CUDA_MEM_FRACTION=0.8 PIN_CPUS=0x0FFF KEEP_AWAKE=1 PYTHONIOENCODING=utf-8
+BATCH_SIZE=4 GRAD_ACCUM_STEPS=4 python train.py          # ~52 min
+BATCH_SIZE=4 GRAD_ACCUM_STEPS=4 python train_reward.py   # ~14 min
+KL_COEF=0.2 python train_ppo.py                          # ~69 min
+python evaluate.py --batch_size 8 --eval_hellaswag       # ~4 min per model, mostly HellaSwag
 python generate.py --instruction "..." [--adapter_checkpoint checkpoints/ppo_adapter.pt | none] [--merge]
 python evaluate.py [--adapters a.pt b.pt] [--eval_hellaswag]
 ```
@@ -59,6 +65,33 @@ python evaluate.py [--adapters a.pt b.pt] [--eval_hellaswag]
   `merge_lora` needs an unquantized base (`generate.py --merge` handles this).
 - PPO keeps LoRA dropout at 0 — dropout makes rollout and update logprobs disagree.
 - PowerShell's `Tee-Object` writes UTF-16 logs; prefer the scripts' own `*_log.txt` files.
+- **The local 8 GB RTX 5050 never OOMs - it spills.** The Windows (WDDM) driver silently falls
+  back to shared system RAM when VRAM is full: steps slow ~2-3x (9x for PPO), then the process
+  can be killed for low system memory (SFT, step ~2000). Two separate causes:
+  - *Real usage*: a 16 x 512-token SFT batch peaks at 8.7 GiB (`BATCH_SIZE=8`: 7.9 GB VRAM +
+    1.5 GB shared), so `train.py` needs `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4` (same effective batch,
+    ~5 GB). `train_reward.py` at `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4` peaks at ~2.9 GB.
+  - *Allocator cache*: PyTorch never gets the OOM that makes it free its cached blocks, so
+    reserved memory outgrows the card even when live tensors fit. `train_ppo.py` defaults:
+    11.46 GiB reserved for 4.65 GiB allocated, 5.9 s per policy+value update. With
+    `CUDA_MEM_FRACTION=0.8`: 5.88 GiB, 0.65 s, and the defaults (`MINI_BATCH=16`) fit. Don't
+    shrink `MINI_BATCH` for memory instead - PPO has no grad accumulation, so it changes the
+    number of updates per rollout, i.e. the recipe.
+  Check with the `\GPU Process Memory(*)\Shared Usage` perf counter (~78 MB is the baseline).
+- **Pin training runs to the P-cores (`PIN_CPUS=0x0FFF`).** Launched from a background shell,
+  Windows runs the process on the i7-13620H's efficiency cores: SFT went 1.37 s/step at 13% GPU
+  utilization (the 124M QLoRA loop is kernel-launch bound on one CPU thread) vs 0.27 s/step
+  pinned. For an already-running process: `$p = Get-Process -Id <pid>; $p.ProcessorAffinity =
+  [IntPtr]0x0FFF; $p.PriorityClass = 'AboveNormal'`.
+- **Unattended runs need `KEEP_AWAKE=1`.** ~30 min after the last keyboard/mouse input the
+  laptop enters Modern Standby, which suspends desktop apps: a PPO run froze for 39 min and was
+  then killed for low system RAM on wake. RAM is tight regardless - ~0.7-2 GB available with the
+  4-model PPO job loaded. Closing the lid still sleeps.
+- **PPO at the default `KL_COEF=0.05` exploits length** with this reward model (0.580 val
+  accuracy vs a 0.555 "longer wins" baseline): by iteration 40, KL 4.5 and climbing, eval length
+  53 -> 87 tokens, finished 92% -> 78%. `KL_COEF=0.2` held KL ~0.7-2 and eval length ~63-77
+  tokens for all 312 iterations. `train_ppo.py` overwrites a single `ppo_adapter.pt` every
+  `SAVE_EVERY` iterations - copy the saves if you want to pick an earlier one.
 - When redirecting script output to a file on Windows, set `PYTHONIOENCODING=utf-8`: stdout
   otherwise falls back to cp1252 and a generated sample containing e.g. `→` crashes the run
   with UnicodeEncodeError.

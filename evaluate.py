@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 from data import collate_fn, encode_response, format_prompt, get_encoding, load_alpaca, right_pad
 from generate import generate_responses
 from model import GPT, GPTConfig, autocast, freeze, lm_loss, load_model
+from runtime import configure_runtime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
@@ -126,6 +127,7 @@ def main():
 
     device = args.device
     print(f"Device: {device}\n")
+    configure_runtime(device)
     adapters = args.adapters
     if adapters is None:
         adapters = [p for p in (os.path.join(CHECKPOINT_DIR, "sft_adapter.pt"), os.path.join(CHECKPOINT_DIR, "ppo_adapter.pt"))
@@ -140,6 +142,8 @@ def main():
     for path in adapters:
         model, ckpt = load_model(args.base_checkpoint, path, quantize=bool(args.quantize), device=device)
         name = ckpt.get("kind") or os.path.splitext(os.path.basename(path))[0]
+        if "iteration" in ckpt:  # PPO snapshots all have kind "ppo" - keep them apart in the results
+            name = f"{name}@{ckpt['iteration']}"
         print(f"Loaded {name} adapter from {path}")
         models.append((name, model.eval()))
 

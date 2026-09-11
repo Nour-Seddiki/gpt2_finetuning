@@ -42,15 +42,74 @@ the top of each script. For a cheap local dry run before renting a GPU, cap the 
 `MAX_TRAIN_EXAMPLES=2000 EPOCHS=1 OUT_DIR=/tmp/ft python train.py` (the commands used for this are
 in [`CLAUDE.md`](CLAUDE.md)).
 
+## Training time
+
+| Stage | Hardware | Settings | Optimizer steps | Wall time |
+|---|---|---|---|---|
+| 1. SFT | RTX 5050 Laptop GPU (8 GB), i7-13620H, Windows 11 | `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4` (effective batch 16), 3 epochs, 4-bit NF4 | 9,363 | **~52 min** (~17 min/epoch) |
+| 2. Reward model | same | `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4` (effective 16 pairs), 1 epoch over 18,457 GPT-4-labeled pairs | 1,153 | **~14 min** |
+| 3. PPO | same | defaults (64 prompts/iteration, `MINI_BATCH=16`, 4 PPO epochs) except `KL_COEF=0.2`; `CUDA_MEM_FRACTION=0.8` | 312 iterations (4,992 updates) | **~69 min** |
+
+Measured on 2026-09-10. Training ran at 0.27 s/step, each val-loss eval (every 200 steps) took
+~13 s, and startup (Alpaca load and tokenization, 4-bit model load) took ~1 min. The logged run
+took 61 min end to end, because its first 340 steps ran before the CPU fix below. The ~52 min is
+that run's measured speed after the fix, applied to all 9,363 steps. It reached best val loss
+2.0769 (ppl 7.98), down from 2.5732, at the final step.
+
+The reward model and PPO were measured on 2026-09-11. The reward model ran at 0.41 s/step, plus
+~10 s per val eval (every 100 steps) and ~3.5 min of startup: 14 min 17 s end to end. PPO ran at
+~11–13 s per iteration (sample 64 responses, score them, 16 minibatch updates), plus ~20 s per
+eval every 10 iterations: 68 min 49 s end to end.
+
+Three things decide whether a run on an 8 GB Windows laptop is fast and finishes at all.
+`runtime.py` handles each with an opt-in env var (all off by default, so A100 runs are unaffected):
+
+- **GPU memory (`CUDA_MEM_FRACTION=0.8`).** Windows doesn't raise OOM when VRAM runs out. The
+  driver spills into shared system RAM, which makes steps ~3× slower and can get the process
+  killed for low memory. A 16 × 512-token SFT batch needs ~8.7 GiB, so SFT uses `BATCH_SIZE=4`
+  (~5 GB). Separately, PyTorch's allocator never sees an OOM, so it never frees its cache: PPO's
+  defaults reserved 11.5 GiB for 4.7 GiB of live tensors and ran 9× slower. Capping the
+  allocator at 80% of VRAM makes it free its cache instead (5.9 GiB reserved, same batch sizes).
+- **CPU cores (`PIN_CPUS=0x0FFF`).** At 124M parameters each forward/backward pass is thousands
+  of tiny kernels, so one CPU thread limits the step time, not the GPU. When the script was
+  started from a background terminal, Windows ran it on the i7's efficiency cores: 1.37 s/step
+  at 13% GPU utilization. Pinning it to the performance cores (logical CPUs 0–11 on the 13620H)
+  made it 5× faster.
+- **Standby (`KEEP_AWAKE=1`).** About 30 minutes after the last keyboard or mouse input, the
+  laptop enters Modern Standby and Windows suspends the training process. One PPO run froze for
+  39 minutes this way and was then killed for low memory when the laptop woke.
+
 ## Results
 
-_Fill in after the full A100 run (`python evaluate.py --eval_hellaswag`)._
+Measured on 2026-09-11 on the laptop with `python evaluate.py --adapters <sft, 3 PPO saves>
+--batch_size 8 --eval_hellaswag` (~20 min). ROUGE, reward score and finished rate come from 100
+Alpaca val prompts sampled at temperature 0.7, with the same seed for every model. HellaSwag is the
+full 10,042-example val set. PPO is the `KL_COEF=0.2` run, at three of its saved iterations.
 
 | model | Alpaca val loss | ROUGE-L | reward-model score | finished responses | HellaSwag |
 |---|---|---|---|---|---|
-| base | | | | | 0.3014 (pretraining) |
-| SFT | | | | | |
-| PPO | | | | | |
+| base | 2.5295 | 0.095 | +0.094 | 8% | 0.3014 |
+| SFT | 2.0769 | 0.278 | −0.145 | 92% | 0.2971 |
+| PPO, iteration 150 | 2.0982 | 0.237 | +0.211 | 88% | 0.2976 |
+| PPO, iteration 250 | 2.1037 | 0.270 | +0.208 | 90% | 0.2965 |
+| PPO, iteration 312 (final) | 2.1040 | 0.260 | +0.194 | 85% | 0.2957 |
+
+- **SFT is the big win.** ROUGE-L goes from 0.095 to 0.278 and finished responses from 8% to 92%.
+  The base model doesn't answer; it continues the prompt, often by writing more `### Response:`
+  blocks.
+- **PPO raised the reward-model score by ~0.35, but not ROUGE.** Every PPO checkpoint has lower
+  ROUGE-L than SFT. Read the reward column with suspicion: the reward model rates the base model's
+  unfinished rambling (+0.094) above SFT's answers (−0.145). That's the same length bias PPO
+  exploited at the default `KL_COEF=0.05`, a run stopped at iteration ~45 with KL at 4.5 and
+  climbing and eval length up from 53 to 87 tokens.
+- **Iteration 250 is the best PPO checkpoint.** It has the same reward gain as iteration 150, with
+  ROUGE-L and finished rate close to SFT's. The last 62 iterations, as the LR annealed to 0, made
+  nothing better.
+- **Little forgetting.** HellaSwag drops 0.4 points from the base model with SFT and stays flat
+  through PPO (0.2957–0.2976).
+- **Side by side**, PPO answers run longer: "Explain machine learning in one sentence." gets two
+  sentences. But for "Give me three ideas for a rainy weekend." PPO lists exactly three numbered
+  ideas where SFT gave four bullets. Every model still gets "What is 2+2?" wrong.
 
 ## How each stage works
 
@@ -93,9 +152,11 @@ rising reward with a KL that keeps climbing and degenerate samples means reward 
 - Alpaca and AlpacaFarm are **CC-BY-NC-4.0** — portfolio/research use only.
 - Alpaca responses are `text-davinci-003` generations, and AlpacaFarm's preferences are GPT-4 (or
   noisy crowd) judgments, so neither is a gold standard.
-- A 124M reward model is weak. In a 1k-pair local dry run it reached 0.615 val accuracy against a
-  0.632 length baseline. Expect modest gains from PPO at this scale, and read the samples rather
-  than trusting the reward curve alone.
+- A 124M reward model is weak. Trained on all 18.5k pairs it reaches 0.580 val accuracy against a
+  0.555 "longer response wins" baseline (a 1k-pair dry run: 0.615 vs 0.632). At the default
+  `KL_COEF=0.05`, PPO learned mostly length from it; `KL_COEF=0.2` kept that in check. Expect
+  modest gains from PPO at this scale, and read the samples rather than trusting the reward curve
+  alone.
 - AlpacaFarm's instructions overlap the Alpaca rows used for SFT. The PPO prompts (unlabeled split)
   are disjoint from the reward model's preference split.
 
