@@ -55,7 +55,8 @@ python evaluate.py [--adapters a.pt b.pt] [--eval_hellaswag]
   only trainable params (LoRA A/B, LayerNorms, scalar `head.*`). Load with `model.load_model(...)`,
   which reads r/alpha from the checkpoint and rejects mismatched keys.
 - **Sampling masks the 47 padding vocab ids** (50257–50303): never trained, and tiktoken can't decode them.
-- `checkpoints/` and `*.pt` are gitignored.
+- `checkpoints/` and `*.pt` are gitignored, except `models/*.pt`: the released weights (adapters in
+  plain git, `*_merged*.pt` through Git LFS per `.gitattributes`).
 
 ## Gotchas
 
