@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from data import collate_fn, format_prompt, load_alpaca
 from generate import generate_responses
 from model import autocast, lm_loss, load_model, save_adapter, trainable_parameters
+from runtime import configure_runtime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -55,6 +56,7 @@ torch.set_float32_matmul_precision("high")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"using device: {device} (quantize={QUANTIZE and device == 'cuda'})")
+configure_runtime(device)
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------------

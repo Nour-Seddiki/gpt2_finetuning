@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 
 from data import get_encoding, left_pad, load_prompts
 from model import EOT_TOKEN_ID, TOKENIZER_VOCAB, autocast, freeze, load_model, save_adapter, trainable_parameters
+from runtime import configure_runtime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -72,6 +73,7 @@ torch.set_float32_matmul_precision("high")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"using device: {device} (quantize={QUANTIZE and device == 'cuda'})")
+configure_runtime(device)
 os.makedirs(OUT_DIR, exist_ok=True)
 for path, script, var in [(SFT_ADAPTER, "train.py", "SFT_ADAPTER"), (REWARD_ADAPTER, "train_reward.py", "REWARD_ADAPTER")]:
     if not os.path.exists(path):
