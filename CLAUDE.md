@@ -104,6 +104,16 @@ python evaluate.py [--adapters a.pt b.pt] [--eval_hellaswag]
   laptop enters Modern Standby, which suspends desktop apps: a PPO run froze for 39 min and was
   then killed for low system RAM on wake. RAM is tight regardless - ~0.7-2 GB available with the
   4-model PPO job loaded. Closing the lid still sleeps.
+- **SFT dataset choice is a trade-off, not an upgrade.** The smol-smoltalk model (3h14m, r=64) wins
+  chat/code/explanation prompts and writes 70-121 word answers; the Alpaca model wins short factual
+  and format-constrained ones because 34-word answers have less room to be wrong. Each also wins val
+  loss and ROUGE on its own dataset by a wide margin, so judge with `evaluate.py --val_dataset` on
+  both plus a blind side-by-side, never one dataset's metrics alone. Eval used for the README:
+  `python evaluate.py --adapters checkpoints/sft_adapter.pt models/ppo_adapter_iter250.pt
+  checkpoints/sft_smoltalk/sft_adapter.pt --batch_size 8 --gen_batch_size 8 --max_tokens 256
+  --top_p 0.9 --repetition_penalty 1.1 [--eval_hellaswag | --val_dataset smoltalk --val_size 1000]`
+  (~25 min with HellaSwag, ~8 min without). The reward model and PPO were trained on the Alpaca SFT
+  policy, so they still pair with `checkpoints/sft_adapter.pt`.
 - **PPO at the default `KL_COEF=0.05` exploits length** with this reward model (0.580 val
   accuracy vs a 0.555 "longer wins" baseline): by iteration 40, KL 4.5 and climbing, eval length
   53 -> 87 tokens, finished 92% -> 78%. `KL_COEF=0.2` held KL ~0.7-2 and eval length ~63-77

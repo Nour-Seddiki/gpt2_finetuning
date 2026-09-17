@@ -78,6 +78,7 @@ in [`CLAUDE.md`](CLAUDE.md)).
 | 1. SFT | RTX 5050 Laptop GPU (8 GB), i7-13620H, Windows 11 | `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4` (effective batch 16), 3 epochs, 4-bit NF4 | 9,363 | **~52 min** (~17 min/epoch) |
 | 2. Reward model | same | `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4` (effective 16 pairs), 1 epoch over 18,457 GPT-4-labeled pairs | 1,153 | **~14 min** |
 | 3. PPO | same | defaults (64 prompts/iteration, `MINI_BATCH=16`, 4 PPO epochs) except `KL_COEF=0.2`; `CUDA_MEM_FRACTION=0.8` | 312 iterations (4,992 updates) | **~69 min** |
+| 1b. SFT on smol-smoltalk | same | `SFT_DATASET=smoltalk EPOCHS=1 LORA_R=64 LORA_ALPHA=128`, `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4`, 398k examples | 24,887 | **~3 h 14 min** |
 
 Measured on 2026-09-10. Training ran at 0.27 s/step, each val-loss eval (every 200 steps) took
 ~13 s, and startup (Alpaca load and tokenization, 4-bit model load) took ~1 min. The logged run
@@ -140,6 +141,82 @@ full 10,042-example val set. PPO is the `KL_COEF=0.2` run, at three of its saved
   sentences. But for "Give me three ideas for a rainy weekend." PPO lists exactly three numbered
   ideas where SFT gave four bullets. Every model still gets "What is 2+2?" wrong.
 
+
+## Better SFT data: Alpaca vs smol-smoltalk
+
+Alpaca's responses are `text-davinci-003` generations from 2023, and they are short and often wrong.
+`SFT_DATASET=smoltalk` runs stage 1 on [smol-smoltalk](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk)
+instead — the mix built for SmolLM2-135M/360M-Instruct, with responses from much stronger models. The
+first exchange of each conversation becomes one Alpaca-template row (a system prompt is the
+instruction and the user turn its input, which is what the rewrite and summarize subsets need); 398k
+of the 460k conversations fit in 512 tokens. One epoch at LoRA r=64 (9,475,584 trainable, 7.1%) took
+3 h 14 min on the laptop and ended at val loss 1.5190 (ppl 4.57), still improving at the last step.
+
+Measured on 2026-09-17 with `--max_tokens 256 --top_p 0.9 --repetition_penalty 1.1` for every model,
+so these numbers are not comparable to the table above (which used plain top-k at 128 tokens). 100
+sampled responses per model per dataset; HellaSwag is the full 10,042-example val set.
+
+| model | Alpaca val loss / ROUGE-L | smoltalk val loss / ROUGE-L | finished | words | HellaSwag |
+|---|---|---|---|---|---|
+| base | 2.5295 / 0.079 | 2.5507 / 0.156 | 30% / 24% | 161 / 170 | 0.3014 |
+| SFT (Alpaca) | **2.0769 / 0.280** | 2.3023 / 0.150 | 99% / 97% | 34 / 45 | 0.2971 |
+| PPO, iteration 250 | 2.1037 / 0.263 | 2.3346 / 0.174 | 98% / 89% | 52 / 60 | 0.2965 |
+| SFT (smol-smoltalk) | 2.2576 / 0.229 | **1.5190 / 0.284** | 86% / 73% | 70 / 121 | 0.2871 |
+
+Each model wins on the distribution it was trained on, by a wide margin in both directions. That is
+the main lesson of the table: at this scale val loss and ROUGE measure how closely a model matches a
+reference style, not how good its answers are. (The smol-smoltalk model's lower finished rate is the
+same effect — its answers average 121 words, so more of them run past `--max_tokens 256`.)
+
+So the tie-break is a blind comparison: 38 hand-written prompts over 11 categories, identical
+decoding for all three models, the three responses shuffled per prompt and labelled A/B/C, and the
+key opened only after judging.
+
+| model | prompts won |
+|---|---|
+| SFT (Alpaca) | 12.0 |
+| SFT (smol-smoltalk) | 11.5 |
+| PPO, iteration 250 | 6.5 |
+
+On 8 of the 38 prompts every model was wrong — arithmetic, "why is the sky blue?", classifying a
+crocodile, and two deliberately unanswerable questions — so those count for nobody. The overall tie
+hides a clean split:
+
+- **smol-smoltalk wins chat 3/3, code 2/2**, explanation 2/3 and advice 2.5/4. It is the only model
+  that answers "Hi! How are you?" as a greeting rather than inventing a person ("I'm currently
+  working on a project in the lab"), and the only one that writes a working `return s[::-1]`.
+- **Alpaca wins factual 2/2, constraint 3.5/5, rewrite 2/3** and classify 1/1. Its 34-word answers
+  leave less room to be wrong: asked who wrote Romeo and Juliet it says "William Shakespeare, a
+  poet", where the smol-smoltalk model writes three paragraphs calling it a Greek tragedy by Homer.
+
+Length is the whole trade. Better data bought fluency, structure and conversational ability, and cost
+terseness — and terseness is what protects a 124M model on short factual questions. Neither model
+knows more than the other; the base checkpoint sets that ceiling.
+
+## Decoding
+
+`GPT.generate` supports nucleus sampling and a repetition penalty (over generated tokens only, so
+rewrites can still reuse the prompt's words). Both are off by default, which keeps PPO's rollouts
+on-policy; the CLIs default to `--top_p 0.9 --repetition_penalty 1.1`. Measured over the same 38
+prompts with the smol-smoltalk model, where "repeats" is the share of word 4-grams that repeat an
+earlier one:
+
+| sampling | repeats | words | finished |
+|---|---|---|---|
+| temperature 0.7, top-k 50 (the old default) | 6.1% | 103 | 97% |
+| temperature 0.7, top-k 50, repetition_penalty 1.1 | **0.1%** | 94 | 97% |
+| temperature 0.7, top-k 50, repetition_penalty 1.2 | 0.0% | 84 | 100% |
+| temperature 0.7, top-p 0.9 | 6.3% | 90 | 95% |
+| temperature 0.7, top-p 0.9, repetition_penalty 1.1 | 0.6% | 90 | 97% |
+| temperature 0.5, top-p 0.9, repetition_penalty 1.1 | 0.7% | 79 | 100% |
+| greedy | 17.1% | 96 | 95% |
+| greedy, repetition_penalty 1.1 | 4.4% | 84 | 97% |
+
+This costs nothing and fixes the most obvious failure: without a penalty a haiku prompt returns "A
+voice of hope, / A voice of hope, / A voice of hope to this day", and the base model repeats whole
+lines a third of the time. It also improves instruction following on its own — "Answer with only the
+word yes or no: is the Earth flat?" goes from "The Earth is flat." to "No."
+
 ## How each stage works
 
 **SFT.** Each example is the Stanford Alpaca prompt template + response + `<|endoftext|>`. Labels
@@ -190,7 +267,12 @@ rising reward with a KL that keeps climbing and degenerate samples means reward 
 
 ## Caveats
 
-- Alpaca and AlpacaFarm are **CC-BY-NC-4.0** — portfolio/research use only.
+- Alpaca and AlpacaFarm are **CC-BY-NC-4.0** — portfolio/research use only. smol-smoltalk is
+  Apache-2.0.
+- The two SFT models are complementary rather than ranked: smol-smoltalk for conversation,
+  explanation and code, Alpaca for short factual and format-constrained answers. The reward model and
+  PPO stages were trained on top of the Alpaca SFT model, so `checkpoints/sft_adapter.pt` remains the
+  default; redoing them on the smol-smoltalk policy would mean retraining both stages.
 - Alpaca responses are `text-davinci-003` generations, and AlpacaFarm's preferences are GPT-4 (or
   noisy crowd) judgments, so neither is a gold standard.
 - A 124M reward model is weak. Trained on all 18.5k pairs it reaches 0.580 val accuracy against a
