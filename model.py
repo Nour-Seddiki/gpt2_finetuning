@@ -194,12 +194,18 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, attention_mask=None, max_new_tokens=128, temperature=1.0, top_k=None, generator=None):
+    def generate(self, idx, attention_mask=None, max_new_tokens=128, temperature=1.0, top_k=None, top_p=None,
+                 repetition_penalty=1.0, generator=None):
         """Batched sampling with a KV cache. idx: (B, P) prompts, LEFT-padded (data.left_pad)
         so every row's last prompt token sits in the last column. Returns (B, n) new token ids,
         n <= max_new_tokens; once a row emits <|endoftext|> it keeps emitting it, so everything
         from a row's first <|endoftext|> on is filler. temperature=0 means greedy decoding.
-        Sampling never picks the 47 untrained padding ids (tiktoken can't decode them)."""
+        Sampling never picks the 47 untrained padding ids (tiktoken can't decode them).
+        top_p keeps the smallest set of tokens whose probability reaches top_p (nucleus sampling).
+        repetition_penalty > 1 scales down the logit of every token this row has already generated
+        (CTRL-style: positive logits divided, negative multiplied). Prompt tokens are exempt, so a
+        rewrite or summary can still reuse the input's words. The defaults leave the policy's
+        distribution untouched - PPO rollouts rely on that."""
         B, P = idx.shape
         max_new_tokens = min(max_new_tokens, self.config.block_size - P)
         if max_new_tokens <= 0:
@@ -207,12 +213,17 @@ class GPT(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(idx)
         vocab_pad = torch.arange(self.config.vocab_size, device=idx.device) >= TOKENIZER_VOCAB
+        seen = torch.zeros(B, self.config.vocab_size, dtype=torch.bool, device=idx.device) if repetition_penalty != 1.0 else None
+        rows = torch.arange(B, device=idx.device)
         finished = torch.zeros(B, dtype=torch.bool, device=idx.device)
         new_tokens = []
         with autocast(idx.device):
             x, past = self.hidden_states(idx, attention_mask=attention_mask)
             for _ in range(max_new_tokens):
                 logits = self.lm_head(x[:, -1]).float().masked_fill(vocab_pad, float("-inf"))
+                if seen is not None:
+                    penalized = torch.where(logits > 0, logits / repetition_penalty, logits * repetition_penalty)
+                    logits = torch.where(seen, penalized, logits)
                 if temperature == 0:
                     next_token = logits.argmax(-1)
                 else:
@@ -220,9 +231,18 @@ class GPT(nn.Module):
                     if top_k is not None:
                         kth = torch.topk(logits, top_k, dim=-1).values[:, -1:]
                         logits = logits.masked_fill(logits < kth, float("-inf"))
+                    if top_p is not None and top_p < 1.0:
+                        sorted_logits, order = logits.sort(dim=-1, descending=True)
+                        probs = F.softmax(sorted_logits, dim=-1)
+                        # drop a token once the tokens ranked above it already reach top_p
+                        # (the most likely token always survives)
+                        drop = probs.cumsum(-1) - probs >= top_p
+                        logits = logits.scatter(-1, order, sorted_logits.masked_fill(drop, float("-inf")))
                     next_token = torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).squeeze(1)
                 next_token = torch.where(finished, EOT_TOKEN_ID, next_token)
                 new_tokens.append(next_token)
+                if seen is not None:
+                    seen[rows, next_token] = True
                 finished |= next_token == EOT_TOKEN_ID
                 if finished.all():
                     break
@@ -313,6 +333,14 @@ def _wrap_with_lora(linear, r, alpha, dropout, quantize, compute_dtype):
     return LoRALinear(base, r=r, alpha=alpha, dropout=dropout)
 
 
+def _train_layernorms(model):
+    for block in model.transformer.h:
+        for p in list(block.ln_1.parameters()) + list(block.ln_2.parameters()):
+            p.requires_grad_(True)
+    for p in model.transformer.ln_f.parameters():
+        p.requires_grad_(True)
+
+
 def apply_qlora(model, r=8, alpha=16, dropout=0.05, quantize=True,
                 compute_dtype=torch.bfloat16, train_layernorms=True):
     """Freezes the whole model, then 4-bit-quantizes + LoRA-wraps the 4 linear
@@ -327,13 +355,53 @@ def apply_qlora(model, r=8, alpha=16, dropout=0.05, quantize=True,
         block.attn.c_proj = _wrap_with_lora(block.attn.c_proj, r, alpha, dropout, quantize, compute_dtype)
         block.mlp.c_fc = _wrap_with_lora(block.mlp.c_fc, r, alpha, dropout, quantize, compute_dtype)
         block.mlp.c_proj = _wrap_with_lora(block.mlp.c_proj, r, alpha, dropout, quantize, compute_dtype)
-        if train_layernorms:
-            for p in list(block.ln_1.parameters()) + list(block.ln_2.parameters()):
-                p.requires_grad_(True)
     if train_layernorms:
-        for p in model.transformer.ln_f.parameters():
-            p.requires_grad_(True)
+        _train_layernorms(model)
     return model
+
+
+# the module names apply_qlora wraps by hand; as peft target_modules, "c_proj" matches both
+# attn.c_proj and mlp.c_proj, so these three names select the same four Linears per block
+PEFT_TARGET_MODULES = ["c_attn", "c_proj", "c_fc"]
+
+
+def _is_peft_lora(module):
+    """A peft LoRA layer (peft.tuners.lora.Linear / .bnb.Linear4bit), duck-typed so that
+    nothing here has to import peft unless the peft backend is actually in use."""
+    return type(module).__module__.startswith("peft.tuners.lora") and hasattr(module, "base_layer")
+
+
+def apply_peft_lora(model, r=8, alpha=16, dropout=0.05, quantize=True,
+                    compute_dtype=torch.bfloat16, train_layernorms=True):
+    """apply_qlora's wrapping done by peft instead of LoRALinear - the opt-in LORA_IMPL=peft
+    backend. Same base quantization, same target modules, same math and the same trainable
+    parameter count; peft just names the adapter weights differently
+    (...c_attn.lora_A.default.weight), which the adapter checkpoint records as lora_impl so
+    load_model can rebuild the right wrapping. The hand-written path stays the default: this
+    project implements LoRA from scratch, and peft is here to show the equivalence."""
+    from peft import LoraConfig, inject_adapter_in_model  # local: optional dependency
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+    if quantize:
+        for block in model.transformer.h:
+            block.attn.c_attn = _quantize_linear(block.attn.c_attn, compute_dtype)
+            block.attn.c_proj = _quantize_linear(block.attn.c_proj, compute_dtype)
+            block.mlp.c_fc = _quantize_linear(block.mlp.c_fc, compute_dtype)
+            block.mlp.c_proj = _quantize_linear(block.mlp.c_proj, compute_dtype)
+    inject_adapter_in_model(
+        LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, bias="none",
+                   target_modules=PEFT_TARGET_MODULES),
+        model,
+    )
+    for name, p in model.named_parameters():
+        p.requires_grad_("lora_" in name)  # peft leaves the base weights frozen; be explicit
+    if train_layernorms:
+        _train_layernorms(model)
+    return model
+
+
+LORA_IMPLS = {"native": apply_qlora, "peft": apply_peft_lora}
 
 
 def _logical_numel(p):
@@ -364,9 +432,21 @@ def adapter_state_dict(model):
     return {name: p.detach().cpu().clone() for name, p in model.named_parameters() if p.requires_grad}
 
 
+def _lora_hyperparameters(model):
+    """(r, alpha, impl) read off the model's first adapter, native or peft."""
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            return module.r, module.alpha, "native"
+        if _is_peft_lora(module):
+            adapter = next(iter(module.r))  # peft keys r/alpha by adapter name ("default")
+            return module.r[adapter], module.lora_alpha[adapter], "peft"
+    raise ValueError("model has no LoRA adapter to save")
+
+
 def save_adapter(path, model, **extra):
-    lora = next(m for m in model.modules() if isinstance(m, LoRALinear))
-    torch.save({"lora_state_dict": adapter_state_dict(model), "lora_r": lora.r, "lora_alpha": lora.alpha, **extra}, path)
+    r, alpha, impl = _lora_hyperparameters(model)
+    torch.save({"lora_state_dict": adapter_state_dict(model), "lora_r": r, "lora_alpha": alpha,
+                "lora_impl": impl, **extra}, path)
 
 
 def load_adapter(model, state_dict):
@@ -380,19 +460,21 @@ def load_adapter(model, state_dict):
 
 def load_model(base_checkpoint, adapter_path=None, scalar_head=False, quantize=True,
                lora_r=8, lora_alpha=16, lora_dropout=0.0, train_layernorms=True,
-               compute_dtype=torch.bfloat16, device="cpu"):
+               lora_impl="native", compute_dtype=torch.bfloat16, device="cpu"):
     """pretrained mini_gpt -> [ScalarHeadGPT] -> 4-bit + LoRA -> [adapter weights] -> device.
-    An adapter's saved rank/alpha override lora_r/lora_alpha. Everything is frozen except the
-    LoRA / LayerNorm / head parameters. 4-bit needs CUDA, so quantize is ignored on CPU.
-    Returns (model, adapter checkpoint dict or None)."""
+    An adapter's saved rank/alpha and backend (lora_impl: "native" LoRALinear or "peft")
+    override the arguments, since they decide how its weights are named. Everything is frozen
+    except the LoRA / LayerNorm / head parameters. 4-bit needs CUDA, so quantize is ignored on
+    CPU. Returns (model, adapter checkpoint dict or None)."""
     quantize = quantize and str(device).startswith("cuda")
     ckpt = None
     if adapter_path:
         ckpt = torch.load(adapter_path, map_location="cpu", weights_only=True)
         lora_r, lora_alpha = ckpt["lora_r"], ckpt["lora_alpha"]
+        lora_impl = ckpt.get("lora_impl", "native")  # adapters saved before the peft backend
     gpt = GPT.from_pretrained_checkpoint(base_checkpoint)
-    apply_qlora(gpt, r=lora_r, alpha=lora_alpha, dropout=lora_dropout, quantize=quantize,
-                compute_dtype=compute_dtype, train_layernorms=train_layernorms)
+    LORA_IMPLS[lora_impl](gpt, r=lora_r, alpha=lora_alpha, dropout=lora_dropout, quantize=quantize,
+                          compute_dtype=compute_dtype, train_layernorms=train_layernorms)
     model = ScalarHeadGPT(gpt) if scalar_head else gpt
     if ckpt is not None:
         load_adapter(model, ckpt["lora_state_dict"])
@@ -407,10 +489,15 @@ def merge_lora(model):
     for module in list(model.modules()):
         for name, child in list(module.named_children()):
             if isinstance(child, LoRALinear):
-                if type(child.base) is not nn.Linear:
-                    raise ValueError("merge_lora needs an unquantized base - load the model with quantize=False")
-                child.base.weight += child.scaling * (child.lora_B @ child.lora_A)
-                setattr(module, name, child.base)
+                base, delta = child.base, child.scaling * (child.lora_B @ child.lora_A)
+            elif _is_peft_lora(child):
+                base, delta = child.base_layer, child.get_delta_weight(next(iter(child.r)))
+            else:
+                continue
+            if type(base) is not nn.Linear:
+                raise ValueError("merge_lora needs an unquantized base - load the model with quantize=False")
+            base.weight += delta
+            setattr(module, name, base)
     return model
 
 

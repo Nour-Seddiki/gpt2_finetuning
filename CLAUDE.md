@@ -4,7 +4,8 @@ Instruction-tuning + RLHF for the from-scratch GPT-2 (124M) pretrained in `../mi
 (checkpoint `../mini_gpt/model_19072.pt`). Three stages, all QLoRA (4-bit NF4 frozen base +
 hand-written LoRA), all single-GPU:
 
-1. `train.py` — SFT on `tatsu-lab/alpaca` → `checkpoints/sft_adapter.pt`
+1. `train.py` — SFT on `tatsu-lab/alpaca`, or on `HuggingFaceTB/smol-smoltalk` with
+   `SFT_DATASET=smoltalk` → `checkpoints/sft_adapter.pt`
 2. `train_reward.py` — reward model on AlpacaFarm preference pairs → `checkpoints/reward_adapter.pt`
 3. `train_ppo.py` — PPO against the reward model, KL-anchored to the SFT model → `checkpoints/ppo_adapter.pt`
 
@@ -26,6 +27,11 @@ OUT_DIR=/tmp/ft MAX_TRAIN_EXAMPLES=2000 VAL_SIZE=128 EPOCHS=1 EVAL_EVERY=25 pyth
 OUT_DIR=/tmp/ft MAX_TRAIN_EXAMPLES=1000 VAL_SIZE=200 BATCH_SIZE=8 EVAL_EVERY=25 python train_reward.py
 OUT_DIR=/tmp/ft TOTAL_EPISODES=192 ROLLOUT_BATCH=16 MINI_BATCH=8 EVAL_PROMPTS=32 EVAL_EVERY=4 MAX_NEW_TOKENS=64 python train_ppo.py
 
+# SFT on smol-smoltalk (460k convs -> 398k first exchanges): ~3h15m on the laptop, r=64
+SFT_DATASET=smoltalk OUT_DIR=checkpoints/sft_smoltalk EPOCHS=1 LORA_R=64 LORA_ALPHA=128 \
+  BATCH_SIZE=4 GRAD_ACCUM_STEPS=4 VAL_SIZE=1000 EVAL_EVERY=1000 python train.py
+LORA_IMPL=peft python train.py   # same LoRA via peft; needs BATCH_SIZE=4 GRAD_ACCUM_STEPS=4 locally
+
 # full pipeline (A100): python train.py && python train_reward.py && python train_ppo.py
 # full pipeline on the local 8 GB Windows laptop - runtime.py knobs, see Gotchas
 export CUDA_MEM_FRACTION=0.8 PIN_CPUS=0x0FFF KEEP_AWAKE=1 PYTHONIOENCODING=utf-8
@@ -42,7 +48,10 @@ python evaluate.py [--adapters a.pt b.pt] [--eval_hellaswag]
 - **Self-contained model code.** `model.py` is a copy of `../mini_gpt/model.py`'s classes. Never
   import `mini_gpt/model.py` (it runs training/DDP setup at import) and never edit it (separate
   repo, pretraining must stay reproducible). Only `../mini_gpt/hellaswag.py` is imported, by `evaluate.py`.
-- **From scratch, no `peft`/`trl`.** LoRA, the reward head, PPO/GAE are all hand-written; keep it that way.
+- **From scratch, no `peft`/`trl`.** LoRA, the reward head, PPO/GAE are all hand-written; keep it
+  that way. The one exception is the opt-in `LORA_IMPL=peft` backend (`model.apply_peft_lora`), which
+  exists to show the hand-written LoRA is equivalent - same targets, same 1,218,048 trainable params
+  at r=8. `native` stays the default and peft stays an optional dependency.
 - **Labels are pre-shifted** in the dataset (`labels[t]` = token after `input_ids[t]`), matching
   mini_gpt's `x = buf[:-1], y = buf[1:]`. `GPT.forward` does *not* shift. Training on unshifted
   labels teaches the model to copy its input (loss → ~0) — this happened once; `sanity_checks.py` guards it.
@@ -51,10 +60,16 @@ python evaluate.py [--adapters a.pt b.pt] [--eval_hellaswag]
   (`build_attn_mask`) so all-pad rows can't produce NaN.
 - **Prompt and response are tokenized separately** (`encode_prompt` + `encode_response`), so the
   training-time prompt ids equal inference-time ids.
-- **Adapter checkpoint format:** `{"lora_state_dict", "lora_r", "lora_alpha", "kind", ...}` holding
-  only trainable params (LoRA A/B, LayerNorms, scalar `head.*`). Load with `model.load_model(...)`,
-  which reads r/alpha from the checkpoint and rejects mismatched keys.
+- **Adapter checkpoint format:** `{"lora_state_dict", "lora_r", "lora_alpha", "lora_impl", "kind", ...}`
+  holding only trainable params (LoRA A/B, LayerNorms, scalar `head.*`). Load with `model.load_model(...)`,
+  which reads r/alpha/impl from the checkpoint and rejects mismatched keys. Adapters written before
+  the peft backend have no `lora_impl` and load as `native`.
 - **Sampling masks the 47 padding vocab ids** (50257–50303): never trained, and tiktoken can't decode them.
+- **Sampling knobs:** `GPT.generate` takes `top_p` and `repetition_penalty` (generated tokens only,
+  not the prompt). Both default to off so PPO rollouts stay on-policy; the two CLIs default to
+  `--top_p 0.9 --repetition_penalty 1.1`, which cut repeated 4-grams from 6.1% to 0.1%.
+- **SFT examples are stored as `uint16`** (`data.AlpacaDataset`), not Python int lists: all of
+  smol-smoltalk is ~0.3 GB that way and ~6 GB as lists, on a laptop with ~3 GB free.
 - `checkpoints/`, `models/` and `*.pt` are gitignored: weights stay local, never commit them.
   `models/` holds the exported set (the 3 adapters + `ppo_merged_bf16.pt`, PPO iteration 250 merged
   and stored in bf16).

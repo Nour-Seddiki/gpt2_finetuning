@@ -2,9 +2,10 @@
 Evaluation for the mini_gpt instruction-tuning pipeline. For the base model and each
 adapter (SFT and/or PPO) it reports:
 
-  - held-out Alpaca val loss / perplexity (response tokens only)
-  - ROUGE-1/2/L of sampled responses vs. the Alpaca reference outputs
-  - mean reward-model score and <|endoftext|> rate of those same responses
+  - held-out val loss / perplexity (response tokens only) on Alpaca or smol-smoltalk
+  - ROUGE-1/2/L of sampled responses vs. that dataset's reference outputs
+  - <|endoftext|> rate, length and repetition (share of repeated word 4-grams) of those responses
+  - mean reward-model score of those same responses
     (when a reward adapter from train_reward.py is available)
   - optionally HellaSwag accuracy - the catastrophic-forgetting check against the base
     model's 30.14%
@@ -16,6 +17,7 @@ Usage:
     python evaluate.py --adapters checkpoints/sft_adapter.pt checkpoints/ppo_adapter.pt
     python evaluate.py --eval_hellaswag                   # full 10,042-example HellaSwag val (slower)
     python evaluate.py --eval_hellaswag --hellaswag_limit 1000
+    python evaluate.py --val_dataset smoltalk --max_tokens 384 --top_p 0.9 --repetition_penalty 1.1
 """
 import argparse
 import math
@@ -27,7 +29,7 @@ from rouge_score import rouge_scorer
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from data import collate_fn, encode_response, format_prompt, get_encoding, load_alpaca, right_pad
+from data import SFT_DATASETS, collate_fn, encode_response, format_prompt, get_encoding, right_pad
 from generate import generate_responses
 from model import GPT, GPTConfig, autocast, freeze, lm_loss, load_model
 from runtime import configure_runtime
@@ -40,6 +42,8 @@ QUALITATIVE_INSTRUCTIONS = [
     "Explain machine learning in one sentence.",
     "Write a haiku about AI.",
     "Give me three ideas for a rainy weekend.",
+    "Hi! How are you?",
+    "What is the capital of France? Answer in one word.",
 ]
 
 
@@ -51,6 +55,14 @@ def rouge(references, predictions):
         for key in totals:
             totals[key] += scores[key].fmeasure
     return {k: v / max(1, len(references)) for k, v in totals.items()}
+
+
+def repetition(text, n=4):
+    """Share of the response's word n-grams that repeat an earlier one: 0 for no repeats, near 1
+    for a response stuck in a loop."""
+    words = text.split()
+    grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    return 1 - len(set(grams)) / len(grams) if grams else 0.0
 
 
 @torch.no_grad()
@@ -108,13 +120,18 @@ def main():
                              "(default: whichever of checkpoints/sft_adapter.pt, checkpoints/ppo_adapter.pt exist)")
     parser.add_argument("--reward_checkpoint", type=str, default=os.path.join(CHECKPOINT_DIR, "reward_adapter.pt"),
                         help="Reward adapter used to score generations (skipped if missing)")
-    parser.add_argument("--val_size", type=int, default=2000, help="Alpaca validation set size (must match training)")
+    parser.add_argument("--val_dataset", choices=sorted(SFT_DATASETS), default="alpaca",
+                        help="Dataset for val loss and the ROUGE references")
+    parser.add_argument("--val_size", type=int, default=2000,
+                        help="Validation set size (for alpaca it must match training: val is carved out of train)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for val loss")
     parser.add_argument("--quantize", type=int, default=1, help="4-bit base weights for the adapter models (CUDA only)")
     parser.add_argument("--n_samples", type=int, default=100,
                         help="Validation examples to generate responses for (ROUGE + reward score)")
     parser.add_argument("--max_tokens", type=int, default=128, help="Max tokens per generated response")
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling threshold (1 = off)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.1, help="1 = off, see GPT.generate")
     parser.add_argument("--gen_batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1337, help="Sampling seed - every model gets the same one")
     parser.add_argument("--skip_generation", action="store_true", help="Only compute val loss (and HellaSwag)")
@@ -133,8 +150,9 @@ def main():
         adapters = [p for p in (os.path.join(CHECKPOINT_DIR, "sft_adapter.pt"), os.path.join(CHECKPOINT_DIR, "ppo_adapter.pt"))
                     if os.path.exists(p)]
 
-    print("Loading Alpaca validation set...")
-    _, val_ds, val_rows = load_alpaca(val_size=args.val_size, seed=1337, max_train_examples=0, return_raw_val=True)
+    print(f"Loading the {args.val_dataset} validation set...")
+    _, val_ds, val_rows = SFT_DATASETS[args.val_dataset](val_size=args.val_size, seed=1337, max_train_examples=0,
+                                                         return_raw_val=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     print(f"Validation examples: {len(val_ds)}\n")
 
@@ -144,6 +162,8 @@ def main():
         name = ckpt.get("kind") or os.path.splitext(os.path.basename(path))[0]
         if "iteration" in ckpt:  # PPO snapshots all have kind "ppo" - keep them apart in the results
             name = f"{name}@{ckpt['iteration']}"
+        if any(name == other for other, _ in models):  # e.g. two SFT adapters: add the folder name
+            name = f"{name}:{os.path.basename(os.path.dirname(os.path.abspath(path)))}"
         print(f"Loaded {name} adapter from {path}")
         models.append((name, model.eval()))
 
@@ -158,6 +178,8 @@ def main():
     prompts = [format_prompt(r["instruction"], r.get("input") or "") for r in rows]
     references = [r["output"].strip() for r in rows]
 
+    sampling = dict(max_tokens=args.max_tokens, temperature=args.temperature, top_p=args.top_p,
+                    repetition_penalty=args.repetition_penalty, seed=args.seed)
     results = {}
     for name, model in models:
         print(f"\n=== {name} ===")
@@ -166,12 +188,14 @@ def main():
         res["ppl"] = math.exp(res["val_loss"])
         print(f"  val loss {res['val_loss']:.4f}, perplexity {res['ppl']:.2f}")
         if not args.skip_generation:
-            responses = generate_responses(model, prompts, max_tokens=args.max_tokens, temperature=args.temperature,
-                                           batch_size=args.gen_batch_size, device=device, seed=args.seed)
+            responses = generate_responses(model, prompts, batch_size=args.gen_batch_size, device=device, **sampling)
             res.update(rouge(references, [text for text, _ in responses]))
             res["eos_rate"] = sum(finished for _, finished in responses) / len(responses)
+            res["repetition"] = sum(repetition(text) for text, _ in responses) / len(responses)
+            res["length"] = sum(len(text.split()) for text, _ in responses) / len(responses)
             print(f"  ROUGE-1/2/L {res['rouge1']:.3f} / {res['rouge2']:.3f} / {res['rougeL']:.3f}, "
-                  f"finished (emitted <|endoftext|>) {100 * res['eos_rate']:.0f}%")
+                  f"finished (emitted <|endoftext|>) {100 * res['eos_rate']:.0f}%, "
+                  f"repeated 4-grams {100 * res['repetition']:.1f}%, {res['length']:.0f} words")
             if reward_model is not None:
                 res["reward"] = reward_scores(reward_model, prompts, responses, device).mean().item()
                 print(f"  mean reward-model score {res['reward']:.3f}")
@@ -183,21 +207,23 @@ def main():
     # summary table
     columns = [("val_loss", "val loss", "{:.4f}"), ("ppl", "ppl", "{:.2f}"), ("rouge1", "ROUGE-1", "{:.3f}"),
                ("rouge2", "ROUGE-2", "{:.3f}"), ("rougeL", "ROUGE-L", "{:.3f}"), ("reward", "RM score", "{:+.3f}"),
-               ("eos_rate", "finished", "{:.0%}"), ("hellaswag", "HellaSwag", "{:.4f}")]
+               ("eos_rate", "finished", "{:.0%}"), ("repetition", "repeats", "{:.1%}"), ("length", "words", "{:.0f}"),
+               ("hellaswag", "HellaSwag", "{:.4f}")]
     columns = [c for c in columns if any(c[0] in r for r in results.values())]
+    width = max(8, *(len(name) + 1 for name in results))
     print("\n" + "=" * 80 + "\nSUMMARY\n" + "=" * 80)
-    print(f"{'model':<8}" + "".join(f"{title:>11}" for _, title, _ in columns))
+    print(f"{'model':<{width}}" + "".join(f"{title:>11}" for _, title, _ in columns))
     for name, res in results.items():
-        print(f"{name:<8}" + "".join(f"{fmt.format(res[key]) if key in res else '-':>11}" for key, _, fmt in columns))
+        print(f"{name:<{width}}" + "".join(f"{fmt.format(res[key]) if key in res else '-':>11}" for key, _, fmt in columns))
 
     if not args.skip_generation:
         print("\n" + "=" * 80 + "\nQUALITATIVE COMPARISON\n" + "=" * 80)
         for instruction in QUALITATIVE_INSTRUCTIONS:
             print(f"\nInstruction: {instruction}")
             for name, model in models:
-                (text, _), = generate_responses(model, [format_prompt(instruction)], max_tokens=80,
-                                                temperature=args.temperature, device=device, seed=args.seed)
-                print(f"  [{name}] {text.strip()[:300]!r}")
+                (text, _), = generate_responses(model, [format_prompt(instruction)], device=device,
+                                                **{**sampling, "max_tokens": min(args.max_tokens, 160)})
+                print(f"  [{name}] {text.strip()[:400]!r}")
 
 
 if __name__ == "__main__":

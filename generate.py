@@ -5,6 +5,7 @@ adapter, or the PPO policy adapter, prompted with the Stanford Alpaca template.
 Usage:
     python generate.py --instruction "Explain quantum computing"
     python generate.py --instruction "..." --input "..." --max_tokens 100 --temperature 0.7
+    python generate.py --instruction "..." --top_p 1.0 --repetition_penalty 1.0   # plain top-k sampling
     python generate.py --instruction "..." --adapter_checkpoint checkpoints/ppo_adapter.pt
     python generate.py --instruction "..." --adapter_checkpoint none         # base model only
     python generate.py --instruction "..." --merge --save_merged merged.pt   # fold LoRA into the weights
@@ -20,8 +21,8 @@ from model import EOT_TOKEN_ID, GPT, GPTConfig, load_model, merge_lora, save_mer
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def generate_responses(model, prompts, max_tokens=128, temperature=0.7, top_k=50, batch_size=16,
-                       device="cuda", seed=None):
+def generate_responses(model, prompts, max_tokens=128, temperature=0.7, top_k=50, top_p=None,
+                       repetition_penalty=1.0, batch_size=16, device="cuda", seed=None):
     """Samples one response per prompt string, in left-padded batches with a KV cache.
     Returns a list of (response_text, finished) - finished is False when the response hit
     max_tokens before emitting <|endoftext|>."""
@@ -32,7 +33,8 @@ def generate_responses(model, prompts, max_tokens=128, temperature=0.7, top_k=50
         prompt_ids = [torch.tensor(enc.encode_ordinary(p), dtype=torch.long) for p in prompts[i:i + batch_size]]
         input_ids, attention_mask = left_pad(prompt_ids)
         out = model.generate(input_ids.to(device), attention_mask.to(device), max_new_tokens=max_tokens,
-                             temperature=temperature, top_k=top_k, generator=generator)
+                             temperature=temperature, top_k=top_k, top_p=top_p,
+                             repetition_penalty=repetition_penalty, generator=generator)
         for row in out.tolist():
             finished = EOT_TOKEN_ID in row
             results.append((enc.decode(row[:row.index(EOT_TOKEN_ID)] if finished else row), finished))
@@ -62,6 +64,9 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=128, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (0 = greedy)")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling threshold (1 = off)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.1,
+                        help="Penalty for tokens the response already contains (1 = off)")
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed, for reproducible output")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -91,7 +96,8 @@ def main():
     prompt = format_prompt(args.instruction, args.input)
     print(f"\nPrompt:\n{prompt}")
     (response, finished), = generate_responses(model, [prompt], max_tokens=args.max_tokens,
-                                               temperature=args.temperature, top_k=args.top_k,
+                                               temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
+                                               repetition_penalty=args.repetition_penalty,
                                                device=device, seed=args.seed)
     print(f"Response:\n{response}")
     if not finished:

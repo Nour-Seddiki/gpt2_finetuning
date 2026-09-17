@@ -12,7 +12,8 @@ import os
 import torch
 
 from data import IGNORE_INDEX, AlpacaDataset, format_prompt, get_encoding, left_pad
-from model import EOT_TOKEN_ID, GPT, LoRALinear, apply_qlora, load_model, merge_lora, trainable_parameters
+from model import (EOT_TOKEN_ID, GPT, LoRALinear, apply_peft_lora, apply_qlora, load_model, merge_lora,
+                   save_adapter, trainable_parameters)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_CHECKPOINT = os.environ.get("BASE_CHECKPOINT", os.path.join(SCRIPT_DIR, "..", "mini_gpt", "model_19072.pt"))
@@ -58,6 +59,16 @@ for i, p in enumerate(prompts):
     assert naive == cached, f"row {i}: {enc.decode(naive)!r} vs {enc.decode(cached)!r}"
 print("[ok] KV cache: batched generation matches full recomputation")
 
+# 3b) sampling options: a vanishing top_p keeps only the argmax, so it must reproduce greedy;
+# a huge repetition penalty must stop greedy decoding from repeating any token
+nucleus = base.generate(ids, mask, max_new_tokens=20, temperature=1.0, top_p=1e-6)
+assert torch.equal(nucleus, out), "top_p -> 0 should be greedy decoding"
+no_repeat = base.generate(ids, mask, max_new_tokens=20, temperature=0, repetition_penalty=1e4)
+for i, row in enumerate(no_repeat.tolist()):
+    row = row[:row.index(EOT_TOKEN_ID)] if EOT_TOKEN_ID in row else row
+    assert len(set(row)) == len(row), f"row {i} repeats a token: {enc.decode(row)!r}"
+print("[ok] sampling: top_p -> 0 is greedy, repetition_penalty blocks repeats")
+
 # 4) merge_lora folds a (non-zero) adapter in exactly
 m = apply_qlora(GPT.from_pretrained_checkpoint(BASE_CHECKPOINT), quantize=False, dropout=0.0).eval()
 for module in m.modules():
@@ -79,3 +90,27 @@ if torch.cuda.is_available():
     print(f"[ok] 4-bit QLoRA: {n_trainable:,} trainable / {n_total:,} params; scalar head scores are finite")
 else:
     print("[skip] 4-bit checks need CUDA")
+
+# 6) the opt-in peft backend (LORA_IMPL=peft): same trainable parameters as the hand-written
+# LoRA, an exact merge, and an adapter checkpoint that load_model can rebuild
+try:
+    import peft  # noqa: F401
+except ImportError:
+    print("[skip] peft backend checks need `pip install peft`")
+else:
+    pm = apply_peft_lora(GPT.from_pretrained_checkpoint(BASE_CHECKPOINT), quantize=False, dropout=0.0).eval()
+    _, n_peft, _ = trainable_parameters(pm)
+    assert n_peft == 1_218_048, n_peft  # identical to the native r=8 count asserted above
+    for module in pm.modules():
+        if hasattr(module, "lora_B") and hasattr(module, "base_layer"):
+            torch.nn.init.normal_(module.lora_B["default"].weight, std=0.02)
+    peft_adapter = os.path.join(os.environ.get("TEMP", "."), "sanity_peft_adapter.pt")
+    save_adapter(peft_adapter, pm, kind="sft")
+    with torch.no_grad():
+        before, _ = pm(ids, attention_mask=mask)
+        reloaded, _ = load_model(BASE_CHECKPOINT, peft_adapter, quantize=False)[0].eval()(ids, attention_mask=mask)
+        after, _ = merge_lora(pm)(ids, attention_mask=mask)
+    assert (before - reloaded).abs().max() < 1e-4, "peft adapter checkpoint didn't round-trip"
+    assert (before - after).abs().max() < 1e-3, "merge_lora is not exact for peft layers"
+    os.remove(peft_adapter)
+    print(f"[ok] peft backend: {n_peft:,} trainable, checkpoint round-trips, merge_lora is exact")

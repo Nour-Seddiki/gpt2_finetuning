@@ -3,7 +3,7 @@
 Takes the GPT-2 (124M) I pretrained from scratch in `mini_gpt` (a separate repo; val loss 3.1067,
 HellaSwag 30.14%) and turns it from a raw text-continuation model into one that follows
 instructions — the full InstructGPT pipeline at miniature scale, written from scratch
-(no `peft`, no `trl`):
+(no `peft`, no `trl`; `LORA_IMPL=peft` swaps in peft's LoRA as an equivalence check):
 
 ```
 pretrained mini_gpt ──SFT──▶ sft_adapter ──┬──────────────▶ policy (trainable) ──PPO──▶ ppo_adapter
@@ -15,7 +15,7 @@ pretrained mini_gpt ──SFT──▶ sft_adapter ──┬──────�
 
 | Stage | Script | Data | Output |
 |---|---|---|---|
-| 1. Supervised fine-tuning | `train.py` | [`tatsu-lab/alpaca`](https://huggingface.co/datasets/tatsu-lab/alpaca), 52k instruction/response pairs | `checkpoints/sft_adapter.pt` |
+| 1. Supervised fine-tuning | `train.py` | [`tatsu-lab/alpaca`](https://huggingface.co/datasets/tatsu-lab/alpaca), 52k instruction/response pairs, or [`HuggingFaceTB/smol-smoltalk`](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk) (`SFT_DATASET=smoltalk`), 460k conversations | `checkpoints/sft_adapter.pt` |
 | 2. Reward model | `train_reward.py` | [`tatsu-lab/alpaca_farm`](https://huggingface.co/datasets/tatsu-lab/alpaca_farm) preference pairs (19.5k GPT-4-labeled, or 9.7k human-labeled) | `checkpoints/reward_adapter.pt` |
 | 3. PPO | `train_ppo.py` | AlpacaFarm's 20k unlabeled instructions (prompts only) | `checkpoints/ppo_adapter.pt` |
 
@@ -57,6 +57,13 @@ python train_ppo.py              # 3. PPO        (~20k episodes)
 
 python evaluate.py --eval_hellaswag
 python generate.py --instruction "Give three tips for staying healthy." --adapter_checkpoint checkpoints/ppo_adapter.pt
+```
+
+Two opt-in variants of stage 1:
+
+```bash
+SFT_DATASET=smoltalk EPOCHS=1 python train.py   # smol-smoltalk instead of Alpaca (see Results)
+LORA_IMPL=peft python train.py                  # the same LoRA, built by peft instead of by hand
 ```
 
 All training knobs are env vars (`BATCH_SIZE=32 EPOCHS=3 python train.py`); see the config block at
@@ -164,6 +171,18 @@ rising reward with a KL that keeps climbing and degenerate samples means reward 
   - `Linear4bit` swap-in and a hand-written `LoRALinear`
   - `ScalarHeadGPT`, used for both the reward model and the value model
   - adapter save/load and LoRA merging
+- Sampling supports nucleus sampling (`top_p`) and a repetition penalty. The penalty applies
+  only to tokens the model generated, never to the prompt, so a rewrite or summary can still
+  reuse the input's words. Both are off in `GPT.generate`'s defaults, which keeps PPO's rollout
+  distribution exactly the policy's; the `generate.py` and `evaluate.py` CLIs default to
+  `--top_p 0.9 --repetition_penalty 1.1`.
+- `LORA_IMPL=peft` wraps the same four projections with peft's LoRA instead of `LoRALinear`,
+  for the same 1,218,048 trainable parameters at r=8. The adapter checkpoint records which
+  backend wrote it (`lora_impl`), so the RLHF stages, `generate.py` and `evaluate.py` rebuild
+  the right wrapping automatically, and `merge_lora` folds in either. `peft` is an optional
+  dependency; the hand-written path is the default and needs nothing installed.
+- Tokenized SFT examples are stored as `uint16` arrays (2 bytes/token). As Python int lists,
+  smol-smoltalk's 398k examples would need ~6 GB of RAM instead of ~0.3 GB.
 - `wte`/`lm_head` are weight-tied, so they're never quantized or LoRA-wrapped.
 - The 47 padding vocab rows (50257–50303) are masked out of sampling and PPO logprobs.
 - `generate.py --merge --save_merged merged.pt` folds the adapter into full-precision weights and

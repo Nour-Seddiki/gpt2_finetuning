@@ -6,3 +6,4 @@ rouge-score
 tqdm
 huggingface-hub
 requests
+peft            # optional, only for LORA_IMPL=peft (the hand-written LoRA is the default)

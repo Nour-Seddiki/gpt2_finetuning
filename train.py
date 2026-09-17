@@ -1,14 +1,17 @@
 """
-Stage 1: supervised instruction fine-tuning (SFT) of the mini_gpt checkpoint on Alpaca with
-QLoRA. Single GPU, no DDP needed - model (124M) and dataset (52k rows) are both tiny relative
-to a rented A100. The adapter it writes (checkpoints/sft_adapter.pt, best val loss) is the
-starting point for the RLHF stages: train_reward.py, then train_ppo.py.
+Stage 1: supervised instruction fine-tuning (SFT) of the mini_gpt checkpoint with QLoRA, on
+Alpaca (SFT_DATASET=alpaca) or smol-smoltalk (SFT_DATASET=smoltalk). Single GPU, no DDP
+needed - the model (124M) and the datasets are both tiny relative to a rented A100. The adapter
+it writes (checkpoints/sft_adapter.pt, best val loss) is the starting point for the RLHF
+stages: train_reward.py, then train_ppo.py.
 See PROJECT_PLAN.md and README.md for the design writeup.
 
 Usage:
     python train.py                              # defaults below
     BATCH_SIZE=32 EPOCHS=3 python train.py        # override via env vars
     QUANTIZE=0 python train.py                    # plain LoRA, no bitsandbytes required
+    LORA_IMPL=peft python train.py                # same LoRA, adapters built by peft
+    SFT_DATASET=smoltalk MAX_TRAIN_EXAMPLES=100000 EPOCHS=1 python train.py
     MAX_TRAIN_EXAMPLES=320 VAL_SIZE=64 EPOCHS=1 EVAL_EVERY=10 python train.py   # local dry run
 """
 import math
@@ -18,7 +21,7 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from data import collate_fn, format_prompt, load_alpaca
+from data import SFT_DATASETS, collate_fn, format_prompt
 from generate import generate_responses
 from model import autocast, lm_loss, load_model, save_adapter, trainable_parameters
 from runtime import configure_runtime
@@ -29,6 +32,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # config - env-var overridable, same convention as mini_gpt/model.py
 BASE_CHECKPOINT = os.environ.get("BASE_CHECKPOINT", os.path.join(SCRIPT_DIR, "..", "mini_gpt", "model_19072.pt"))
 OUT_DIR = os.environ.get("OUT_DIR", os.path.join(SCRIPT_DIR, "checkpoints"))
+SFT_DATASET = os.environ.get("SFT_DATASET", "alpaca")  # a key of data.SFT_DATASETS
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", 512))
 VAL_SIZE = int(os.environ.get("VAL_SIZE", 2000))
 MAX_TRAIN_EXAMPLES = os.environ.get("MAX_TRAIN_EXAMPLES")
@@ -43,6 +47,7 @@ WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", 0.01))
 LORA_R = int(os.environ.get("LORA_R", 8))
 LORA_ALPHA = int(os.environ.get("LORA_ALPHA", 16))
 LORA_DROPOUT = float(os.environ.get("LORA_DROPOUT", 0.05))
+LORA_IMPL = os.environ.get("LORA_IMPL", "native")  # "native" = model.py's LoRALinear, or "peft"
 QUANTIZE = os.environ.get("QUANTIZE", "1") == "1"
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", 200))
 LOG_EVERY = int(os.environ.get("LOG_EVERY", 20))
@@ -55,14 +60,15 @@ if torch.cuda.is_available():
 torch.set_float32_matmul_precision("high")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"using device: {device} (quantize={QUANTIZE and device == 'cuda'})")
+print(f"using device: {device} (quantize={QUANTIZE and device == 'cuda'}, lora_impl={LORA_IMPL})")
 configure_runtime(device)
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------------
 # data
-print("loading tatsu-lab/alpaca from HuggingFace...")
-train_ds, val_ds = load_alpaca(max_seq_len=MAX_SEQ_LEN, val_size=VAL_SIZE, seed=SEED, max_train_examples=MAX_TRAIN_EXAMPLES)
+print(f"loading the {SFT_DATASET} SFT dataset from HuggingFace...")
+train_ds, val_ds = SFT_DATASETS[SFT_DATASET](max_seq_len=MAX_SEQ_LEN, val_size=VAL_SIZE, seed=SEED,
+                                             max_train_examples=MAX_TRAIN_EXAMPLES)
 print(f"train examples: {len(train_ds)}, val examples: {len(val_ds)}")
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
@@ -72,7 +78,7 @@ val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn
 # model: the mini_gpt pretrained checkpoint with QLoRA injected
 print(f"loading base checkpoint from {BASE_CHECKPOINT}")
 model, _ = load_model(BASE_CHECKPOINT, quantize=QUANTIZE, lora_r=LORA_R, lora_alpha=LORA_ALPHA,
-                      lora_dropout=LORA_DROPOUT, device=device)
+                      lora_dropout=LORA_DROPOUT, lora_impl=LORA_IMPL, device=device)
 
 trainable, n_trainable, n_total = trainable_parameters(model)
 print(f"trainable params: {n_trainable:,} / {n_total:,} ({100 * n_trainable / n_total:.2f}%)")

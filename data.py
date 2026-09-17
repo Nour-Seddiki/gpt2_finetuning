@@ -1,7 +1,9 @@
 """
 Data pipelines for the three stages of instruction-tuning mini_gpt:
 
-  1. SFT (train.py)            - tatsu-lab/alpaca: 52k instruction/input/output rows
+  1. SFT (train.py)            - tatsu-lab/alpaca: 52k instruction/input/output rows, or
+                                 HuggingFaceTB/smol-smoltalk: 460k conversations, first exchange
+                                 of each rendered as an Alpaca row
   2. reward (train_reward.py)  - tatsu-lab/alpaca_farm preference pairs: two outputs for
                                  the same instruction + which one is better
   3. PPO (train_ppo.py)        - tatsu-lab/alpaca_farm unlabeled instructions: prompts only,
@@ -10,6 +12,7 @@ Data pipelines for the three stages of instruction-tuning mini_gpt:
 Every stage renders prompts with the Stanford Alpaca template and tokenizes with tiktoken's
 gpt2 BPE - the same vocab space the pretrained mini_gpt checkpoint already uses.
 """
+import numpy as np
 import tiktoken
 import torch
 from datasets import load_dataset
@@ -102,14 +105,16 @@ class AlpacaDataset(Dataset):
             ids = prompt_ids + encode_response(enc, row["output"])
             if len(ids) - 1 > max_seq_len:
                 continue  # drop rather than truncate - truncating would corrupt the response
-            self.examples.append((ids, len(prompt_ids)))
+            # uint16 holds every gpt2 id (max 50256) at 2 bytes/token; a list of Python ints
+            # costs ~36, i.e. ~5 GB of RAM for all of smol-smoltalk
+            self.examples.append((np.array(ids, dtype=np.uint16), len(prompt_ids)))
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
         ids, prompt_len = self.examples[idx]
-        ids = torch.tensor(ids, dtype=torch.long)
+        ids = torch.from_numpy(ids.astype(np.int64))
         input_ids, labels = ids[:-1], ids[1:].clone()
         # labels[prompt_len - 1] is the first response token (predicted from the prompt's last
         # token); every label before it is still part of the prompt
@@ -142,6 +147,49 @@ def load_alpaca(max_seq_len=512, val_size=2000, seed=1337, max_train_examples=No
     if return_raw_val:
         return train_ds, val_ds, val_rows
     return train_ds, val_ds
+
+
+def smoltalk_to_alpaca(example):
+    """The first exchange of a smol-smoltalk conversation as an Alpaca row. A system prompt
+    becomes the instruction and the first user turn its input: in the rewrite and summarize
+    subsets the system prompt is the task and the user turn is the text to work on. Rows
+    without a user -> assistant exchange come back with an empty output (filtered out)."""
+    messages = example["messages"]
+    system = messages[0]["content"].strip() if messages[0]["role"] == "system" else ""
+    turns = messages[1:] if system else messages
+    if len(turns) < 2 or turns[0]["role"] != "user" or turns[1]["role"] != "assistant":
+        return {"instruction": "", "input": "", "output": ""}
+    user, reply = turns[0]["content"].strip(), turns[1]["content"].strip()
+    if system:
+        return {"instruction": system, "input": user, "output": reply}
+    return {"instruction": user, "input": "", "output": reply}
+
+
+def load_smoltalk(max_seq_len=512, val_size=2000, seed=1337, max_train_examples=None,
+                  return_raw_val=False):
+    """HuggingFaceTB/smol-smoltalk (Apache-2.0), the SFT mix built for SmolLM2-135M/360M-Instruct,
+    reduced to first exchanges in the Alpaca template. Same interface as load_alpaca; val rows
+    come from the dataset's own test split. About 13% of first exchanges are over 512 tokens
+    and get dropped, so max_train_examples counts rows before that filter."""
+    enc = get_encoding()
+
+    def rows(split, n):
+        ds = load_dataset("HuggingFaceTB/smol-smoltalk", split=split).shuffle(seed=seed)
+        if n is not None:
+            ds = ds.select(range(min(len(ds), 2 * n)))  # headroom for the rows filtered out below
+        ds = ds.map(smoltalk_to_alpaca, remove_columns=["messages"]).filter(lambda r: bool(r["output"]))
+        return ds.select(range(min(len(ds), n))) if n is not None else ds
+
+    val_rows = rows("test", val_size)
+    train_rows = rows("train", max_train_examples)
+    train_ds = AlpacaDataset(train_rows, enc, max_seq_len=max_seq_len)
+    val_ds = AlpacaDataset(val_rows, enc, max_seq_len=max_seq_len)
+    if return_raw_val:
+        return train_ds, val_ds, val_rows
+    return train_ds, val_ds
+
+
+SFT_DATASETS = {"alpaca": load_alpaca, "smoltalk": load_smoltalk}
 
 
 # -----------------------------------------------------------------------------
