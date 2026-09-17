@@ -15,7 +15,7 @@ pretrained mini_gpt ──SFT──▶ sft_adapter ──┬──────�
 
 | Stage | Script | Data | Output |
 |---|---|---|---|
-| 1. Supervised fine-tuning | `train.py` | [`tatsu-lab/alpaca`](https://huggingface.co/datasets/tatsu-lab/alpaca), 52k instruction/response pairs, or [`HuggingFaceTB/smol-smoltalk`](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk) (`SFT_DATASET=smoltalk`), 460k conversations | `checkpoints/sft_adapter.pt` |
+| 1. Supervised fine-tuning | `train.py` | [`tatsu-lab/alpaca`](https://huggingface.co/datasets/tatsu-lab/alpaca), 52k instruction/response pairs, or [`HuggingFaceTB/smol-smoltalk`](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk) (`SFT_DATASET=smoltalk`), 460k conversations, or both (`SFT_DATASET=mix`) | `checkpoints/sft_adapter.pt` |
 | 2. Reward model | `train_reward.py` | [`tatsu-lab/alpaca_farm`](https://huggingface.co/datasets/tatsu-lab/alpaca_farm) preference pairs (19.5k GPT-4-labeled, or 9.7k human-labeled) | `checkpoints/reward_adapter.pt` |
 | 3. PPO | `train_ppo.py` | AlpacaFarm's 20k unlabeled instructions (prompts only) | `checkpoints/ppo_adapter.pt` |
 
@@ -62,7 +62,8 @@ python generate.py --instruction "Give three tips for staying healthy." --adapte
 Two opt-in variants of stage 1:
 
 ```bash
-SFT_DATASET=smoltalk EPOCHS=1 python train.py   # smol-smoltalk instead of Alpaca (see Results)
+SFT_DATASET=mix EPOCHS=1 python train.py        # Alpaca + smol-smoltalk (see Results)
+SFT_DATASET=smoltalk EPOCHS=1 python train.py   # smol-smoltalk only
 LORA_IMPL=peft python train.py                  # the same LoRA, built by peft instead of by hand
 ```
 
@@ -79,6 +80,7 @@ in [`CLAUDE.md`](CLAUDE.md)).
 | 2. Reward model | same | `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4` (effective 16 pairs), 1 epoch over 18,457 GPT-4-labeled pairs | 1,153 | **~14 min** |
 | 3. PPO | same | defaults (64 prompts/iteration, `MINI_BATCH=16`, 4 PPO epochs) except `KL_COEF=0.2`; `CUDA_MEM_FRACTION=0.8` | 312 iterations (4,992 updates) | **~69 min** |
 | 1b. SFT on smol-smoltalk | same | `SFT_DATASET=smoltalk EPOCHS=1 LORA_R=64 LORA_ALPHA=128`, `BATCH_SIZE=4 GRAD_ACCUM_STEPS=4`, 398k examples | 24,887 | **~3 h 14 min** |
+| 1c. SFT on the mix | same | `SFT_DATASET=mix`, otherwise as above, 207k examples | 12,917 | **~1 h 33 min** |
 
 Measured on 2026-09-10. Training ran at 0.27 s/step, each val-loss eval (every 200 steps) took
 ~13 s, and startup (Alpaca load and tokenization, 4-bit model load) took ~1 min. The logged run
@@ -152,35 +154,42 @@ instruction and the user turn its input, which is what the rewrite and summarize
 of the 460k conversations fit in 512 tokens. One epoch at LoRA r=64 (9,475,584 trainable, 7.1%) took
 3 h 14 min on the laptop and ended at val loss 1.5190 (ppl 4.57), still improving at the last step.
 
-Measured on 2026-09-17 with `--max_tokens 256 --top_p 0.9 --repetition_penalty 1.1` for every model,
+Training on smol-smoltalk alone costs the terse, format-obedient answers Alpaca teaches, so
+`SFT_DATASET=mix` trains on both: all of Alpaca plus enough smol-smoltalk to leave Alpaca at
+`MIX_ALPACA_FRACTION` (0.25) of the examples — 51,684 + 154,987 = 206,671 examples, 1 h 33 min.
+
+Measured on 2026-09-18 with `--max_tokens 256 --top_p 0.9 --repetition_penalty 1.1` for every model,
 so these numbers are not comparable to the table above (which used plain top-k at 128 tokens). 100
 sampled responses per model per dataset; HellaSwag is the full 10,042-example val set.
 
 | model | Alpaca val loss / ROUGE-L | smoltalk val loss / ROUGE-L | finished | words | HellaSwag |
 |---|---|---|---|---|---|
 | base | 2.5295 / 0.079 | 2.5507 / 0.156 | 30% / 24% | 161 / 170 | 0.3014 |
-| SFT (Alpaca) | **2.0769 / 0.280** | 2.3023 / 0.150 | 99% / 97% | 34 / 45 | 0.2971 |
+| SFT (Alpaca) | 2.0769 / **0.280** | 2.3023 / 0.150 | 99% / 97% | 34 / 45 | 0.2971 |
 | PPO, iteration 250 | 2.1037 / 0.263 | 2.3346 / 0.174 | 98% / 89% | 52 / 60 | 0.2965 |
-| SFT (smol-smoltalk) | 2.2576 / 0.229 | **1.5190 / 0.284** | 86% / 73% | 70 / 121 | 0.2871 |
+| SFT (smol-smoltalk) | 2.2576 / 0.229 | **1.5190** / **0.284** | 86% / 73% | 70 / 121 | 0.2871 |
+| **SFT (mix)** | **2.0189** / 0.257 | 1.6206 / 0.279 | 97% / 74% | 41 / 119 | 0.2893 |
 
-Each model wins on the distribution it was trained on, by a wide margin in both directions. That is
-the main lesson of the table: at this scale val loss and ROUGE measure how closely a model matches a
-reference style, not how good its answers are. (The smol-smoltalk model's lower finished rate is the
-same effect — its answers average 121 words, so more of them run past `--max_tokens 256`.)
+The two single-dataset models each win on the distribution they were trained on, by a wide margin in
+both directions — at this scale val loss and ROUGE measure how closely a model matches a reference
+style as much as how good its answers are. The mix is the interesting row: it beats the Alpaca model
+on Alpaca's own val loss (2.0189 vs 2.0769) while landing within 0.005 ROUGE-L of the smol-smoltalk
+model on smol-smoltalk, and its answers average 41 words rather than 121.
 
-So the tie-break is a blind comparison: 38 hand-written prompts over 11 categories, identical
-decoding for all three models, the three responses shuffled per prompt and labelled A/B/C, and the
-key opened only after judging.
+The tie-break is a blind comparison: 38 hand-written prompts over 11 categories, identical decoding
+for every model, the responses shuffled per prompt and labelled A/B/C, and the key opened only after
+judging. Two rounds, three models each:
 
-| model | prompts won |
-|---|---|
-| SFT (Alpaca) | 12.0 |
-| SFT (smol-smoltalk) | 11.5 |
-| PPO, iteration 250 | 6.5 |
+| model | round 1 | round 2 |
+|---|---|---|
+| SFT (Alpaca) | 12.0 | 12.5 |
+| **SFT (mix)** | — | **12.0** |
+| SFT (smol-smoltalk) | 11.5 | 5.5 |
+| PPO, iteration 250 | 6.5 | — |
 
 On 8 of the 38 prompts every model was wrong — arithmetic, "why is the sky blue?", classifying a
-crocodile, and two deliberately unanswerable questions — so those count for nobody. The overall tie
-hides a clean split:
+crocodile, and two deliberately unanswerable questions — so those count for nobody. Behind the
+round-1 tie is a clean split:
 
 - **smol-smoltalk wins chat 3/3, code 2/2**, explanation 2/3 and advice 2.5/4. It is the only model
   that answers "Hi! How are you?" as a greeting rather than inventing a person ("I'm currently
@@ -189,9 +198,20 @@ hides a clean split:
   leave less room to be wrong: asked who wrote Romeo and Juliet it says "William Shakespeare, a
   poet", where the smol-smoltalk model writes three paragraphs calling it a Greek tragedy by Homer.
 
-Length is the whole trade. Better data bought fluency, structure and conversational ability, and cost
-terseness — and terseness is what protects a 124M model on short factual questions. Neither model
-knows more than the other; the base checkpoint sets that ceiling.
+Round 2 is what the mix was for. It takes over most of what smol-smoltalk used to win — chat,
+explanation, rewriting (where it is the only model that actually fixes the grammar: "I went to the
+store yesterday and bought some apple's") — while matching Alpaca on constraint-following, which
+drops smol-smoltalk from 11.5 to 5.5. Alpaca keeps factual recall, where brevity is the only defence
+a 124M model has.
+
+Length is the whole trade. Better data buys fluency, structure and conversational range, and costs
+terseness; mixing a quarter of Alpaca back in buys the terseness back for one extra hour of training.
+None of the three knows more than the others — the base checkpoint sets that ceiling, and all three
+still fail at 2+2.
+
+Two caveats on the blind comparison: 38 prompts judged by one reader is a small, noisy sample, so the
+0.5-point gaps in each round mean nothing (the 12.0-vs-5.5 gap does), and the judging is blind to
+which model wrote what, not to what the judge expected to see.
 
 ## Decoding
 
@@ -269,10 +289,9 @@ rising reward with a KL that keeps climbing and degenerate samples means reward 
 
 - Alpaca and AlpacaFarm are **CC-BY-NC-4.0** — portfolio/research use only. smol-smoltalk is
   Apache-2.0.
-- The two SFT models are complementary rather than ranked: smol-smoltalk for conversation,
-  explanation and code, Alpaca for short factual and format-constrained answers. The reward model and
-  PPO stages were trained on top of the Alpaca SFT model, so `checkpoints/sft_adapter.pt` remains the
-  default; redoing them on the smol-smoltalk policy would mean retraining both stages.
+- `SFT_DATASET=mix` is the best all-round SFT recipe here, but the RLHF stages were trained on the
+  Alpaca SFT policy, so `checkpoints/sft_adapter.pt` stays the default adapter; pairing the reward
+  model and PPO with a mix policy means retraining both stages.
 - Alpaca responses are `text-davinci-003` generations, and AlpacaFarm's preferences are GPT-4 (or
   noisy crowd) judgments, so neither is a gold standard.
 - A 124M reward model is weak. Trained on all 18.5k pairs it reaches 0.580 val accuracy against a

@@ -12,12 +12,14 @@ Data pipelines for the three stages of instruction-tuning mini_gpt:
 Every stage renders prompts with the Stanford Alpaca template and tokenizes with tiktoken's
 gpt2 BPE - the same vocab space the pretrained mini_gpt checkpoint already uses.
 """
+import os
+
 import numpy as np
 import tiktoken
 import torch
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset, Subset
 
 IGNORE_INDEX = -100  # torch.nn.functional.cross_entropy's default ignore_index
 PAD_TOKEN_ID = 0  # arbitrary: padded positions are masked out of attention and of every loss
@@ -189,7 +191,40 @@ def load_smoltalk(max_seq_len=512, val_size=2000, seed=1337, max_train_examples=
     return train_ds, val_ds
 
 
-SFT_DATASETS = {"alpaca": load_alpaca, "smoltalk": load_smoltalk}
+MIX_ALPACA_FRACTION = float(os.environ.get("MIX_ALPACA_FRACTION", 0.25))
+SMOLTALK_FIT_RATE = 0.865  # share of smol-smoltalk rows that fit in 512 tokens, for sizing below
+
+
+def load_mix(max_seq_len=512, val_size=2000, seed=1337, max_train_examples=None, return_raw_val=False,
+             alpaca_fraction=MIX_ALPACA_FRACTION):
+    """smol-smoltalk and Alpaca in one training set. Trained on smol-smoltalk alone the model wins
+    conversation, explanation and code but loses the short factual and format-constrained answers
+    Alpaca's terse responses teach; mixing keeps both. alpaca_fraction (MIX_ALPACA_FRACTION) is
+    Alpaca's share of the examples, and the validation set mixes them the same way. With
+    max_train_examples unset, all of Alpaca is used and smol-smoltalk is sized around it."""
+    alpaca_val = max(1, round(val_size * alpaca_fraction))
+    alpaca_n = round(max_train_examples * alpaca_fraction) if max_train_examples else None
+    a_train, a_val, a_raw = load_alpaca(max_seq_len, alpaca_val, seed, alpaca_n, return_raw_val=True)
+
+    # smol-smoltalk's loader counts rows before the 512-token filter, so ask for enough to land on
+    # the target example count, then take exactly that many
+    smoltalk_n = round(len(a_train) * (1 - alpaca_fraction) / alpaca_fraction)
+    s_train, s_val, s_raw = load_smoltalk(max_seq_len, val_size - alpaca_val, seed,
+                                          round(smoltalk_n / SMOLTALK_FIT_RATE), return_raw_val=True)
+    s_train = Subset(s_train, range(min(smoltalk_n, len(s_train))))
+
+    train_ds, val_ds = ConcatDataset([a_train, s_train]), ConcatDataset([a_val, s_val])
+    print(f"  mix: {len(a_train)} alpaca + {len(s_train)} smol-smoltalk training examples "
+          f"({len(a_train) / max(1, len(train_ds)):.0%} alpaca)")
+    if return_raw_val:
+        # shuffled, so that a caller sampling the first N rows (evaluate.py) gets both datasets
+        columns = ["instruction", "input", "output"]
+        raw = concatenate_datasets([a_raw.select_columns(columns), s_raw.select_columns(columns)])
+        return train_ds, val_ds, raw.shuffle(seed=seed)
+    return train_ds, val_ds
+
+
+SFT_DATASETS = {"alpaca": load_alpaca, "smoltalk": load_smoltalk, "mix": load_mix}
 
 
 # -----------------------------------------------------------------------------

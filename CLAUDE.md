@@ -27,7 +27,11 @@ OUT_DIR=/tmp/ft MAX_TRAIN_EXAMPLES=2000 VAL_SIZE=128 EPOCHS=1 EVAL_EVERY=25 pyth
 OUT_DIR=/tmp/ft MAX_TRAIN_EXAMPLES=1000 VAL_SIZE=200 BATCH_SIZE=8 EVAL_EVERY=25 python train_reward.py
 OUT_DIR=/tmp/ft TOTAL_EPISODES=192 ROLLOUT_BATCH=16 MINI_BATCH=8 EVAL_PROMPTS=32 EVAL_EVERY=4 MAX_NEW_TOKENS=64 python train_ppo.py
 
-# SFT on smol-smoltalk (460k convs -> 398k first exchanges): ~3h15m on the laptop, r=64
+# SFT on Alpaca + smol-smoltalk, 25% Alpaca (207k examples): ~1h33m, the best all-round recipe
+SFT_DATASET=mix OUT_DIR=checkpoints/sft_mix EPOCHS=1 LORA_R=64 LORA_ALPHA=128 \
+  BATCH_SIZE=4 GRAD_ACCUM_STEPS=4 VAL_SIZE=1000 EVAL_EVERY=1000 python train.py
+
+# SFT on smol-smoltalk alone (460k convs -> 398k first exchanges): ~3h15m on the laptop, r=64
 SFT_DATASET=smoltalk OUT_DIR=checkpoints/sft_smoltalk EPOCHS=1 LORA_R=64 LORA_ALPHA=128 \
   BATCH_SIZE=4 GRAD_ACCUM_STEPS=4 VAL_SIZE=1000 EVAL_EVERY=1000 python train.py
 LORA_IMPL=peft python train.py   # same LoRA via peft; needs BATCH_SIZE=4 GRAD_ACCUM_STEPS=4 locally
@@ -106,7 +110,10 @@ python evaluate.py [--adapters a.pt b.pt] [--eval_hellaswag]
   4-model PPO job loaded. Closing the lid still sleeps.
 - **SFT dataset choice is a trade-off, not an upgrade.** The smol-smoltalk model (3h14m, r=64) wins
   chat/code/explanation prompts and writes 70-121 word answers; the Alpaca model wins short factual
-  and format-constrained ones because 34-word answers have less room to be wrong. Each also wins val
+  and format-constrained ones because 34-word answers have less room to be wrong. `SFT_DATASET=mix`
+  (25% Alpaca, 1h33m) gets both: best Alpaca val loss of any model (2.0189), within 0.005 ROUGE-L of
+  the smol-smoltalk model on smol-smoltalk, and it beat the smol-smoltalk model 12.0-5.5 in a blind
+  38-prompt comparison. Each also wins val
   loss and ROUGE on its own dataset by a wide margin, so judge with `evaluate.py --val_dataset` on
   both plus a blind side-by-side, never one dataset's metrics alone. Eval used for the README:
   `python evaluate.py --adapters checkpoints/sft_adapter.pt models/ppo_adapter_iter250.pt
